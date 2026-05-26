@@ -119,7 +119,7 @@ def _select_sparse_decode_config(
         block_h_override is None
         and block_k_override is None
         and num_warps_override is None
-        and not _env_bool_default("DSV4_SPARSE_ATTN_DECODE_DYNAMIC_DEFAULT", False)
+        and not _env_bool_default("DSV4_SPARSE_ATTN_DECODE_DYNAMIC_DEFAULT", True)
     ):
         return block_h, block_k, num_warps
 
