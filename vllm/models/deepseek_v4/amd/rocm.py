@@ -515,7 +515,7 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder)
             assert self.c128a_decode_topk_ragged_indices_buffer is not None
             assert self.c128a_decode_topk_ragged_indptr_buffer is not None
             dense_decode_2d = dense_decode.reshape(dense_decode.shape[0], -1)
-            if _env_bool_default("DSV4_STATIC_DECODE_RAGGED_METADATA_DEFAULT", False):
+            if _env_bool_default("DSV4_STATIC_DECODE_RAGGED_METADATA_DEFAULT", True):
                 ragged_indices, ragged_indptr = build_ragged_indices_from_dense_out(
                     dense_decode_2d,
                     decode_lens,
