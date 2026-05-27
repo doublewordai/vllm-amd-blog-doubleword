@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import json
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -38,42 +36,6 @@ if TYPE_CHECKING:
     from vllm.models.deepseek_v4.nvidia.ops.attention import (
         DeepseekV4MLAAttention,
     )
-
-
-def _env_flag(name: str) -> bool:
-    return os.getenv(name, "0") == "1"
-
-
-def _env_bool_default(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    return value not in ("0", "false", "False", "no", "No")
-
-
-def _log_sparse_prefill_mem_metrics(
-    event: str,
-    device: torch.device,
-    **fields: int | float | str | bool,
-) -> None:
-    if not _env_flag("DSV4_SPARSE_PREFILL_MEM_METRICS"):
-        return
-    free = total = allocated = reserved = 0
-    try:
-        free, total = torch.cuda.mem_get_info(device)
-        allocated = torch.cuda.memory_allocated(device)
-        reserved = torch.cuda.memory_reserved(device)
-    except Exception:
-        pass
-    record = {
-        "event": event,
-        "free": int(free),
-        "total": int(total),
-        "allocated": int(allocated),
-        "reserved": int(reserved),
-        **fields,
-    }
-    print("DSV4_SPARSE_PREFILL_MEM " + json.dumps(record, sort_keys=True), flush=True)
 
 
 def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
@@ -515,19 +477,13 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder)
             assert self.c128a_decode_topk_ragged_indices_buffer is not None
             assert self.c128a_decode_topk_ragged_indptr_buffer is not None
             dense_decode_2d = dense_decode.reshape(dense_decode.shape[0], -1)
-            if _env_bool_default("DSV4_STATIC_DECODE_RAGGED_METADATA_DEFAULT", True):
-                ragged_indices, ragged_indptr = build_ragged_indices_from_dense_out(
-                    dense_decode_2d,
-                    decode_lens,
-                    self.c128a_decode_topk_ragged_indices_buffer,
-                    self.c128a_decode_topk_ragged_indptr_buffer,
-                    max_entries_per_row=self.c128a_max_compressed,
-                )
-            else:
-                ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
-                    dense_decode_2d,
-                    decode_lens,
-                )
+            ragged_indices, ragged_indptr = build_ragged_indices_from_dense_out(
+                dense_decode_2d,
+                decode_lens,
+                self.c128a_decode_topk_ragged_indices_buffer,
+                self.c128a_decode_topk_ragged_indptr_buffer,
+                max_entries_per_row=self.c128a_max_compressed,
+            )
 
         return DeepseekV4ROCMAiterMLASparseMetadata(
             **vars(base),
@@ -571,19 +527,10 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             and base.decode_swa_lens is not None
         ):
             decode_swa_2d = base.decode_swa_indices.reshape(base.num_decode_tokens, -1)
-            if _env_bool_default("DSV4_STATIC_DECODE_RAGGED_METADATA_DEFAULT", False):
-                ragged_indices, ragged_indptr = build_ragged_indices_from_dense_out(
-                    decode_swa_2d,
-                    base.decode_swa_lens,
-                    self.decode_swa_ragged_indices_buffer,
-                    self.decode_swa_ragged_indptr_buffer,
-                    max_entries_per_row=self.window_size,
-                )
-            else:
-                ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
-                    decode_swa_2d,
-                    base.decode_swa_lens,
-                )
+            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+                decode_swa_2d,
+                base.decode_swa_lens,
+            )
 
         return DeepseekV4ROCMAiterSparseSWAMetadata(
             **vars(base),
@@ -801,7 +748,7 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             cls.PREFILL_CHUNK_SIZE
         )
 
-        dynamic_workspace = _env_flag("DSV4_DYNAMIC_PREFILL_KV_WORKSPACE")
+        dynamic_workspace = True
         default_N = (
             0
             if swa_only
@@ -842,19 +789,6 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 torch.bfloat16,
             ),
         )[0]
-        _log_sparse_prefill_mem_metrics(
-            "workspace_allocated",
-            q.device,
-            dynamic_workspace=dynamic_workspace,
-            num_prefills=int(num_prefills),
-            num_prefill_tokens=int(num_prefill_tokens),
-            prefill_chunk_size=int(cls.PREFILL_CHUNK_SIZE),
-            workspace_M=int(workspace_M),
-            default_M=int(default_M),
-            top_k=int(top_k),
-            compress_ratio=int(layer.compress_ratio),
-            swa_only=bool(swa_only),
-        )
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * cls.PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + cls.PREFILL_CHUNK_SIZE, num_prefills)
@@ -875,15 +809,6 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             else:
                 N = default_N
                 M = default_M
-            _log_sparse_prefill_mem_metrics(
-                "chunk_start",
-                q.device,
-                chunk_idx=int(chunk_idx),
-                chunk_size=int(chunk_size),
-                M=int(M),
-                N=int(N),
-                workspace_M=int(workspace_M),
-            )
             if not swa_only:
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None

@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import json
-import os
 from contextlib import contextmanager
-from pathlib import Path
 
 import torch
 
@@ -38,16 +35,7 @@ from ..utils import swiglu_limit_func
 
 logger = init_logger(__name__)
 
-_MOE_SHAPE_DUMP_COUNT = 0
-_MOE_SHAPE_DUMP_WARNED = False
 _ogs_opt_flags = None
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    return int(value)
 
 
 def _dsv4_flash_rocm_ogs_constraints(
@@ -60,8 +48,6 @@ def _dsv4_flash_rocm_ogs_constraints(
     activation: MoEActivation,
 ) -> dict[str, int] | None:
     if not current_platform.is_rocm():
-        return None
-    if os.environ.get("VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_TUNED", "1") == "0":
         return None
 
     # These are the high-throughput DeepSeek-V4-Flash routed-expert shapes on
@@ -76,18 +62,13 @@ def _dsv4_flash_rocm_ogs_constraints(
         and topk == 6
         and activation == MoEActivation.SILU
     ):
-        default_block_m = 32 if m < 1024 else 64
         constraints = {
-            "block_m": _env_int(
-                "VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_BLOCK_M", default_block_m
-            ),
-            "block_n": _env_int("VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_BLOCK_N", 128),
-            "block_k": _env_int("VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_BLOCK_K", 128),
+            "block_m": 32 if m < 1024 else 64,
+            "block_n": 128,
+            "block_k": 128,
         }
         if m >= 1024:
-            constraints["epilogue_subtile"] = _env_int(
-                "VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_EPILOGUE_SUBTILE", 16
-            )
+            constraints["epilogue_subtile"] = 16
         return constraints
     return None
 
@@ -109,87 +90,6 @@ def _temporary_ogs_constraints(constraints: dict[str, int] | None):
         _ogs_opt_flags.reset_opt_flags_constraints()
         if previous:
             _ogs_opt_flags.update_opt_flags_constraints(previous)
-
-
-def _maybe_dump_dsv4_moe_shape(
-    *,
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk: int,
-    activation: MoEActivation,
-    global_num_experts: int,
-) -> None:
-    dump_dir = os.environ.get("DSV4_MOE_SHAPE_DUMP_DIR")
-    if not dump_dir:
-        return
-
-    # Host copies inside graph capture are illegal on ROCm and would also
-    # perturb the graph. Shape collection is an eager/profiling-only mode.
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-        return
-
-    global _MOE_SHAPE_DUMP_COUNT
-    limit = int(os.environ.get("DSV4_MOE_SHAPE_DUMP_LIMIT", "0") or "0")
-    if limit > 0 and _MOE_SHAPE_DUMP_COUNT >= limit:
-        return
-
-    stride = max(1, int(os.environ.get("DSV4_MOE_SHAPE_DUMP_STRIDE", "1") or "1"))
-    _MOE_SHAPE_DUMP_COUNT += 1
-    if (_MOE_SHAPE_DUMP_COUNT - 1) % stride != 0:
-        return
-
-    min_m = int(os.environ.get("DSV4_MOE_SHAPE_DUMP_MIN_M", "0") or "0")
-    M, K = hidden_states.shape
-    if M < min_m:
-        return
-
-    try:
-        local_num_experts = int(w1.shape[0])
-        valid_topk = topk_ids[topk_ids >= 0].reshape(-1)
-        hist = torch.bincount(
-            valid_topk.to(torch.int64), minlength=local_num_experts
-        )[:local_num_experts].cpu()
-        nonzero = hist[hist > 0]
-        if nonzero.numel() == 0:
-            p90_nonzero = 0
-            hist_max = 0
-        else:
-            p90_nonzero = int(
-                torch.quantile(nonzero.float(), 0.9).round().item()
-            )
-            hist_max = int(nonzero.max().item())
-
-        rec = {
-            "pid": os.getpid(),
-            "rank": os.environ.get("RANK"),
-            "local_rank": os.environ.get("LOCAL_RANK"),
-            "count": _MOE_SHAPE_DUMP_COUNT,
-            "activation": activation.name,
-            "M": int(M),
-            "K": int(K),
-            "topk": int(topk),
-            "global_num_experts": int(global_num_experts),
-            "local_num_experts": local_num_experts,
-            "w1_shape": list(w1.shape),
-            "w2_shape": list(w2.shape),
-            "hist_sum": int(hist.sum().item()),
-            "hist_nonzero": int(nonzero.numel()),
-            "hist_max": hist_max,
-            "p90_nonzero": p90_nonzero,
-            "hist": [int(x) for x in hist.tolist()],
-        }
-        path = Path(dump_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        filename = f"moe_shapes_rank{rec['rank'] or 'x'}_pid{os.getpid()}.jsonl"
-        with (path / filename).open("a") as f:
-            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
-    except Exception as e:
-        global _MOE_SHAPE_DUMP_WARNED
-        if not _MOE_SHAPE_DUMP_WARNED:
-            _MOE_SHAPE_DUMP_WARNED = True
-            logger.warning("Failed to dump DeepSeek V4 MoE shape: %s", e)
 
 
 def _triton_kernel_moe_supports_current_device() -> bool:
@@ -1032,16 +932,6 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
 
         if global_num_experts == -1:
             global_num_experts = E
-
-        _maybe_dump_dsv4_moe_shape(
-            hidden_states=hidden_states,
-            w1=w1,
-            w2=w2,
-            topk_ids=topk_ids,
-            topk=topk,
-            activation=activation,
-            global_num_experts=global_num_experts,
-        )
 
         # Note that the output tensor might be in workspace13
         intermediate_cache1 = _resize_cache(workspace2, (batch_dim, M * topk, N))
